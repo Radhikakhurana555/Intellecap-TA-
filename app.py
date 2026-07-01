@@ -1,10 +1,12 @@
 import os
+import re
+import zipfile
 from io import BytesIO
 from typing import Optional, Dict, List
 
 import pandas as pd
 import streamlit as st
-from openai import OpenAI
+from groq import Groq
 from pypdf import PdfReader
 from docx import Document
 
@@ -22,9 +24,12 @@ APP_SUBTITLE = "Resume screening, candidate summaries, interview questions, and 
 def get_api_key() -> Optional[str]:
     """Read API key from Streamlit secrets or environment variable."""
     try:
-        return st.secrets.get("OPENAI_API_KEY")
+        key = st.secrets.get("GROQ_API_KEY")
+        if key:
+            return key
     except Exception:
-        return os.getenv("OPENAI_API_KEY")
+        pass
+    return os.getenv("GROQ_API_KEY")
 
 
 def extract_text_from_pdf(file) -> str:
@@ -61,7 +66,9 @@ def extract_text(file) -> str:
 
 
 def truncate_text(text: str, limit: int = 20000) -> str:
-    """Keep prompt size controlled."""
+    """Keep prompt size controlled. Llama-3.1-8b-instant has a smaller context
+    window than large frontier models, so we keep this tighter than you might
+    with GPT-class models."""
     if len(text) <= limit:
         return text
     return text[:limit] + "\n\n[Text truncated for analysis. Please review original document if needed.]"
@@ -91,10 +98,10 @@ Additional candidate context, if provided:
 {candidate_context}
 
 JOB DESCRIPTION:
-{truncate_text(jd_text, 16000)}
+{truncate_text(jd_text, 14000)}
 
 CANDIDATE RESUME:
-{truncate_text(resume_text, 22000)}
+{truncate_text(resume_text, 18000)}
 
 Return the response in the following format:
 
@@ -133,17 +140,24 @@ Mention that this is AI-assisted screening and should be validated by HR and the
 """
 
 
-def call_openai(prompt: str, model_name: str, api_key: str) -> str:
-    client = OpenAI(api_key=api_key)
-    response = client.responses.create(
+def call_groq(prompt: str, model_name: str, api_key: str) -> str:
+    client = Groq(api_key=api_key)
+    response = client.chat.completions.create(
         model=model_name,
-        instructions=(
-            "You are a careful HR assistant. Be concise, neutral, and evidence-based. "
-            "Avoid discriminatory or protected-class inferences. Use only the supplied text."
-        ),
-        input=prompt,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a careful HR assistant. Be concise, neutral, and evidence-based. "
+                    "Avoid discriminatory or protected-class inferences. Use only the supplied text."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.3,
+        max_tokens=2000,
     )
-    return response.output_text
+    return response.choices[0].message.content
 
 
 def make_download_bundle(results: Dict[str, str]) -> bytes:
@@ -157,7 +171,6 @@ def make_download_bundle(results: Dict[str, str]) -> bytes:
 
 
 def parse_score(result_text: str) -> Optional[int]:
-    import re
     patterns = [
         r"Fitment Score:\s*(\d{1,3})\s*/\s*100",
         r"Fitment Score\s*[:\-]\s*(\d{1,3})",
@@ -178,7 +191,20 @@ def main():
     with st.sidebar:
         st.header("Settings")
         role_title = st.text_input("Role title", value="Consultant / Manager")
-        model_name = st.text_input("OpenAI model", value="gpt-5.2")
+        model_name = st.selectbox(
+            "Groq model",
+            options=[
+                "openai/gpt-oss-120b",
+                "openai/gpt-oss-20b",
+                "qwen/qwen3.6-27b",
+            ],
+            index=0,
+            help=(
+                "llama-3.1-8b-instant and llama-3.3-70b-versatile were deprecated by Groq "
+                "in June 2026. gpt-oss-120b is the default here for stronger fitment judgment "
+                "and more reliable table formatting; gpt-oss-20b is the fast/cheap fallback."
+            ),
+        )
         st.info(
             "Keep the app human-in-the-loop. The bot assists screening and drafting; HR and hiring managers should make final decisions."
         )
@@ -202,8 +228,9 @@ def main():
 
     if not api_key:
         st.warning(
-            "OPENAI_API_KEY is not configured. Add it in Streamlit Cloud → App settings → Secrets. "
-            "You can still prepare the inputs, but analysis will run after the key is added."
+            "GROQ_API_KEY is not configured. Add it in Streamlit Cloud → App settings → Secrets "
+            "(or set it as an environment variable). You can still prepare the inputs, but analysis "
+            "will run after the key is added."
         )
 
     col1, col2 = st.columns(2)
@@ -248,7 +275,7 @@ def main():
             st.error("Please upload at least one resume.")
             return
         if not api_key:
-            st.error("Please configure OPENAI_API_KEY in Streamlit secrets before running analysis.")
+            st.error("Please configure GROQ_API_KEY in Streamlit secrets before running analysis.")
             return
 
         all_results: Dict[str, str] = {}
@@ -272,7 +299,7 @@ def main():
                     screening_weights=screening_weights,
                 )
                 try:
-                    result = call_openai(prompt, model_name=model_name, api_key=api_key)
+                    result = call_groq(prompt, model_name=model_name, api_key=api_key)
                 except Exception as exc:
                     result = f"Analysis failed for {resume_file.name}: {exc}"
 
